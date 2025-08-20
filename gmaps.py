@@ -52,7 +52,11 @@ def read_excel(file):
 
 @st.cache_data(show_spinner=False)
 def guess_cms(url: str, timeout=5):
-    """Rileva solo se è WordPress. Restituisce 'WordPress', 'Altro', 'No site'."""
+    """Semplice regola: è WordPress se /wp-admin NON restituisce 404.
+    - Prova http/https e varianti con/senza www
+    - Segue i redirect (login, ecc.)
+    Ritorna: 'WordPress', 'Altro' o 'No site'.
+    """
     sess = requests.Session()
     sess.headers.update({"User-Agent":"Mozilla/5.0"})
 
@@ -60,48 +64,53 @@ def guess_cms(url: str, timeout=5):
         if not u or u == "nan":
             return []
         u = u.strip()
-        bases = []
-        if not u.startswith("http"):
-            bases = [f"https://{u}", f"http://{u}"]
-        else:
-            bases = [u]
+        bases = [u] if u.startswith("http") else [f"https://{u}", f"http://{u}"]
         out = set()
         for b in bases:
-            out.add(b)
+            out.add(b.rstrip('/'))
             if "://www." in b:
-                out.add(b.replace("://www.", "://"))
+                out.add(b.replace("://www.", "://").rstrip('/'))
             else:
-                parts = b.split("://", 1)
-                out.add(parts[0]+"://www."+parts[1])
+                proto, rest = b.split("://", 1)
+                out.add(f"{proto}://www.{rest}".rstrip('/'))
         return list(out)
 
-    def hit(url: str):
+    def is_wp(base: str) -> bool:
         try:
-            return sess.get(url, timeout=timeout, allow_redirects=True)
+            r = sess.get(base + "/wp-admin", timeout=timeout, allow_redirects=True)
+            # se NON è 404, consideriamo WP (200/301/302/401/403 tipici)
+            if r is not None and r.status_code != 404:
+                return True
+            # fallback su /wp-login.php, stessa regola
+            r2 = sess.get(base + "/wp-login.php", timeout=timeout, allow_redirects=True)
+            if r2 is not None and r2.status_code != 404:
+                return True
         except Exception:
-            return None
-
-    def looks_wp(r) -> bool:
-        if r is None:
             return False
-        text = r.text.lower() if isinstance(r.text, str) else ""
-        return any(k in text for k in ["wp-content","wp-includes","wp-json","wordpress"])
+        return False
 
     variants = norm_variants(url)
     if not variants:
         return "No site"
-
     for base in variants:
-        base = base.rstrip("/")
-        r = hit(base)
-        if looks_wp(r):
+        if is_wp(base):
             return "WordPress"
-        for ep in ["/wp-login.php", "/wp-admin", "/wp-json"]:
-            rr = hit(base + ep)
-            if rr and rr.status_code in (200,301,302,401,403):
-                if ep == "/wp-json" and "application/json" in rr.headers.get("content-type"," "):
-                    return "WordPress"
-                return "WordPress"
+    return "Altro"
+    sess.headers.update({"User-Agent":"Mozilla/5.0"})
+
+    if not url or url == "nan":
+        return "No site"
+    u = url.strip()
+    if not u.startswith("http"):
+        u = "http://" + u
+    base = u.rstrip("/")
+
+    try:
+        r = sess.get(base + "/wp-admin", timeout=timeout, allow_redirects=True)
+        if r is not None and r.status_code != 404:
+            return "WordPress"
+    except Exception:
+        pass
     return "Altro"
 
 @st.cache_data(show_spinner=False)
