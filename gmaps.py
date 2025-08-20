@@ -55,118 +55,77 @@ def read_excel(file):
         st.stop()
 
 @st.cache_data(show_spinner=False)
-def guess_cms(url: str, timeout=6):
-    """Rilevazione CMS robusta.
-    - Normalizza URL (http/https, www)
-    - Controlla meta generator, HTML e header server
-    - Prova endpoint tipici: /wp-json (WP), /wp-login.php (WP)
-    Ritorna una stringa tra: WordPress, Shopify, Wix, Squarespace, Joomla, Drupal,
-    PrestaShop, Magento, Webflow, Weebly, Blogger, Unknown, No site.
+def guess_cms(url: str, timeout=5):
+    """Rileva *solo* se è WordPress. Altrimenti 'Altro' o 'No site'.
+    Strategie:
+    - Normalizzazione URL (+ varianti con/ senza www)
+    - Probe endpoint: /wp-login.php, /wp-admin, /wp-json (200/301/302/401/403 sufficienti)
+    - Pattern HTML: wp-content, wp-includes, wp-json
     """
     import re
-    from bs4 import BeautifulSoup  # optional dependency; we fall back if missing
     sess = requests.Session()
     sess.headers.update({"User-Agent":"Mozilla/5.0"})
 
-    def _try(url):
+    def norm_variants(u: str):
+        if not u or u == "nan":
+            return []
+        u = u.strip()
+        bases = []
+        if not u.startswith("http"):
+            bases = [f"https://{u}", f"http://{u}"]
+        else:
+            bases = [u]
+        out = set()
+        for b in bases:
+            out.add(b)
+            # aggiungi variante www/non-www
+            if "://www." in b:
+                out.add(b.replace("://www.", "://"))
+            else:
+                parts = b.split("://", 1)
+                out.add(parts[0]+"://www."+parts[1])
+        return list(out)
+
+    def hit(url: str):
         try:
             r = sess.get(url, timeout=timeout, allow_redirects=True)
             return r
         except Exception:
             return None
 
-    def _norm(u):
-        if not u or u == "nan":
-            return []
-        u = u.strip()
-        # aggiungi schema se manca
-        candidates = []
-        if not u.startswith("http"):
-            candidates += [f"https://{u}", f"http://{u}"]
-        else:
-            candidates.append(u)
-        # aggiungi variante www se manca/presente
-        out = set()
-        for c in candidates:
-            p = urlparse(c)
-            host = p.netloc
-            if host.startswith("www."):
-                out.add(c)
-                out.add(c.replace("//www.", "//"))
-            else:
-                out.add(c)
-                out.add(c.replace("//", "//www."))
-        return list(out)
-
-    # indicatori
-    def detect_from_response(r):
+    def looks_wp(r) -> bool:
         if r is None:
-            return None
-        h = {k.lower():v for k,v in r.headers.items()}
+            return False
+        ct = r.headers.get("content-type", "").lower()
         text = r.text.lower() if isinstance(r.text, str) else ""
-        # meta generator
-        gen = ""
-        try:
-            from bs4 import BeautifulSoup
-            soup = BeautifulSoup(r.text, 'html.parser')
-            m = soup.find("meta", attrs={"name":"generator"})
-            if m and m.get("content"):
-                gen = m.get("content").lower()
-        except Exception:
-            pass
+        if any(k in text for k in ["wp-content","wp-includes","wp-json","wordpress"]):
+            return True
+        # alcuni host mascherano l'HTML delle pagine di login ma danno 200/401/403 su endpoint WP
+        return False
 
-        def any_in(s, keys):
-            return any(k in s for k in keys)
+    variants = norm_variants(url)
+    if not variants:
+        return "No site"
 
-        # WordPress
-        if any_in(text, ["wp-content","wp-json","wp-includes","wordpress"]) or any_in(gen, ["wordpress"]):
+    for base in variants:
+        base = base.rstrip("/")
+        # 1) pattern rapido: HTML home
+        r = hit(base)
+        if looks_wp(r):
             return "WordPress"
-        # Shopify
-        if any_in(text, ["shopify"]) or any_in(" ".join([f"{k}:{v}" for k,v in h.items()]), ["shopid","x-shopify","x-cache: hit from cloudfront"]):
-            return "Shopify"
-        # Wix
-        if any_in(text, ["wixsite","wix.com"]) or "x-wix-request-id" in h:
-            return "Wix"
-        # Squarespace
-        if "x-squarespace-server" in h or any_in(text, ["squarespace"]):
-            return "Squarespace"
-        # Joomla
-        if any_in(text, ["joomla"]) or "x-content-powered-by:joomla" in " ".join(h.keys()):
-            return "Joomla"
-        # Drupal
-        if any_in(text, ["drupal-settings-json","drupal"] ) or "x-generator" in h and "drupal" in h.get("x-generator"," ").lower():
-            return "Drupal"
-        # PrestaShop
-        if any_in(text, ["prestashop"]) or any(k.lower().startswith("prestashop") for k in r.cookies.keys()):
-            return "PrestaShop"
-        # Magento
-        if any_in(text, ["mage-", "magento"]) or any(k.lower().startswith("x-magento") for k in h.keys()):
-            return "Magento"
-        # Webflow
-        if any_in(text, ["webflow"]):
-            return "Webflow"
-        # Weebly
-        if any_in(text, ["weebly"]):
-            return "Weebly"
-        # Blogger
-        if any_in(text, ["blogger"]) or "blogspot." in r.url.lower():
-            return "Blogger"
-        return None
-
-    # tenta URL e varianti
-    for candidate in _norm(url):
-        r = _try(candidate)
-        cms = detect_from_response(r)
-        if cms:
-            return cms
-        # endpoint specifici WP
-        if r is not None and r.status_code < 500:
-            for ep in ["/wp-json", "/wp-login.php"]:
-                rr = _try(candidate.rstrip("/") + ep)
-                if rr is not None and rr.status_code in (200, 401, 403):
-                    if "wordpress" in (rr.text.lower() if isinstance(rr.text,str) else "") or "application/json" in rr.headers.get("content-type"," "):
-                        return "WordPress"
-    return "Unknown"
+        # 2) endpoint tipici
+        for ep in ["/wp-login.php", "/wp-admin", "/wp-json"]:
+            rr = hit(base + ep)
+            if rr is None:
+                continue
+            # se risponde con 200/301/302/401/403 è molto probabile che sia WP
+            if rr.status_code in (200, 301, 302, 401, 403):
+                # check minimo sul contenuto per wp-json
+                if ep == "/wp-json" and "application/json" in rr.headers.get("content-type"," "):
+                    return "WordPress"
+                # wp-login/wp-admin spesso redirectano: buono lo stesso
+                return "WordPress"
+    return "Altro"
 
 @st.cache_data(show_spinner=False)
 def process(df: pd.DataFrame, weights):
@@ -227,15 +186,18 @@ weights = (w1,w2,w3,w4)
 processed = process(raw, weights)
 
 # CMS detection on-demand
-with st.expander("🔎 Rileva CMS (WordPress/altro) — esegue richieste web, usa con parsimonia"):
+with st.expander("🔎 Rileva WordPress — esegue richieste web, usa con parsimonia"):
     run_cms = st.checkbox("Esegui rilevazione CMS ora", value=False)
     if run_cms:
         st.warning("Verranno effettuate richieste HTTP ai siti presenti.")
         processed['cms_guess'] = processed['site'].astype(str).apply(guess_cms)
     else:
-        # fallback veloce da URL
+        # fallback veloce da URL solo per WP
         processed['cms_guess'] = np.where(
-            processed['site'].astype(str).str.contains('wordpress|wp-content|wp-json', case=False, na=False),
+            processed['site'].astype(str).str.contains('wp-content|wp-json|wp-includes|/wp-', case=False, na=False),
+            'WordPress (pattern URL)',
+            np.where(processed['has_website'], 'Altro', 'No site')
+        ).str.contains('wordpress|wp-content|wp-json', case=False, na=False),
             'WordPress (URL pattern)',
             np.where(processed['has_website'], 'Unknown', 'No site')
         )
@@ -250,7 +212,7 @@ with col2:
 with col3:
     site_filter = st.selectbox("Sito web", ["Tutti","Con sito","Senza sito"])
 with col4:
-    cms_filter = st.selectbox("CMS", ["Tutti","WordPress","Non WordPress","Unknown","No site"]) 
+    cms_filter = st.selectbox("CMS", ["Tutti","WordPress","Altro","No site"])  
 
 f = processed.copy()
 if city_sel:
@@ -265,8 +227,6 @@ elif site_filter=="Senza sito":
 if cms_filter != "Tutti":
     if cms_filter == "WordPress":
         f = f[f['cms_guess'].str.contains("WordPress", na=False)]
-    elif cms_filter == "Non WordPress":
-        f = f[~f['cms_guess'].str.contains("WordPress", na=False) & (f['cms_guess'] != 'No site') & (f['cms_guess'] != 'Unknown')]
     else:
         f = f[f['cms_guess'] == cms_filter]
 
