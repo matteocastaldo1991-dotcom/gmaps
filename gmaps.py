@@ -14,7 +14,7 @@ st.caption("Carica l'Excel di Outscraper, filtra, mappa e calcola un punteggio d
 # -----------------------------
 with st.sidebar:
     st.header("⚙️ Importa dati")
-    up = st.file_uploader("Excel da Outscraper (.xlsx)", type=["xlsx"])  
+    up = st.file_uploader("Excel da Outscraper (.xlsx) o CSV", type=["xlsx","xls","csv"])  
     st.markdown("**Colonne attese** (se presenti): name, site, phone, full_address, city, latitude, longitude, rating, reviews, photos_count, reviews_per_score_1..5")
     st.divider()
     st.header("🔧 Opzioni punteggio")
@@ -31,24 +31,20 @@ with st.sidebar:
 # -----------------------------
 @st.cache_data(show_spinner=False)
 def read_excel(file):
-    """Robusta lettura: supporta .xlsx/.xls/.xlsm (richiede openpyxl) e .csv.
-    Mostra un errore chiaro se manca openpyxl in cloud."""
-    from io import BytesIO
+    """Supporta sia Excel (openpyxl) sia CSV."""
     from pathlib import Path
     name = getattr(file, "name", "uploaded")
     ext = Path(name).suffix.lower()
     if ext in [".csv", ".txt"]:
-        # prova autodetect del separatore
         try:
             return pd.read_csv(file)
         except Exception:
             file.seek(0)
             return pd.read_csv(file, sep=";")
-    # Excel
     try:
         return pd.read_excel(file, engine="openpyxl")
     except ImportError:
-        st.error("Manca il pacchetto `openpyxl`. Aggiungilo a requirements.txt: `openpyxl>=3.1.3`.")
+        st.error("Manca `openpyxl`. Aggiungilo a requirements.txt: openpyxl>=3.1.3")
         st.stop()
     except Exception as e:
         st.exception(e)
@@ -56,13 +52,7 @@ def read_excel(file):
 
 @st.cache_data(show_spinner=False)
 def guess_cms(url: str, timeout=5):
-    """Rileva *solo* se è WordPress. Altrimenti 'Altro' o 'No site'.
-    Strategie:
-    - Normalizzazione URL (+ varianti con/ senza www)
-    - Probe endpoint: /wp-login.php, /wp-admin, /wp-json (200/301/302/401/403 sufficienti)
-    - Pattern HTML: wp-content, wp-includes, wp-json
-    """
-    import re
+    """Rileva solo se è WordPress. Restituisce 'WordPress', 'Altro', 'No site'."""
     sess = requests.Session()
     sess.headers.update({"User-Agent":"Mozilla/5.0"})
 
@@ -78,7 +68,6 @@ def guess_cms(url: str, timeout=5):
         out = set()
         for b in bases:
             out.add(b)
-            # aggiungi variante www/non-www
             if "://www." in b:
                 out.add(b.replace("://www.", "://"))
             else:
@@ -88,20 +77,15 @@ def guess_cms(url: str, timeout=5):
 
     def hit(url: str):
         try:
-            r = sess.get(url, timeout=timeout, allow_redirects=True)
-            return r
+            return sess.get(url, timeout=timeout, allow_redirects=True)
         except Exception:
             return None
 
     def looks_wp(r) -> bool:
         if r is None:
             return False
-        ct = r.headers.get("content-type", "").lower()
         text = r.text.lower() if isinstance(r.text, str) else ""
-        if any(k in text for k in ["wp-content","wp-includes","wp-json","wordpress"]):
-            return True
-        # alcuni host mascherano l'HTML delle pagine di login ma danno 200/401/403 su endpoint WP
-        return False
+        return any(k in text for k in ["wp-content","wp-includes","wp-json","wordpress"])
 
     variants = norm_variants(url)
     if not variants:
@@ -109,27 +93,19 @@ def guess_cms(url: str, timeout=5):
 
     for base in variants:
         base = base.rstrip("/")
-        # 1) pattern rapido: HTML home
         r = hit(base)
         if looks_wp(r):
             return "WordPress"
-        # 2) endpoint tipici
         for ep in ["/wp-login.php", "/wp-admin", "/wp-json"]:
             rr = hit(base + ep)
-            if rr is None:
-                continue
-            # se risponde con 200/301/302/401/403 è molto probabile che sia WP
-            if rr.status_code in (200, 301, 302, 401, 403):
-                # check minimo sul contenuto per wp-json
+            if rr and rr.status_code in (200,301,302,401,403):
                 if ep == "/wp-json" and "application/json" in rr.headers.get("content-type"," "):
                     return "WordPress"
-                # wp-login/wp-admin spesso redirectano: buono lo stesso
                 return "WordPress"
     return "Altro"
 
 @st.cache_data(show_spinner=False)
 def process(df: pd.DataFrame, weights):
-    # Crea colonne richieste se mancanti
     needed = ['name','site','phone','full_address','city','latitude','longitude',
               'rating','reviews','photos_count',
               'reviews_per_score_1','reviews_per_score_2','reviews_per_score_3',
@@ -137,41 +113,36 @@ def process(df: pd.DataFrame, weights):
     for c in needed:
         if c not in df.columns:
             df[c] = np.nan
-
-    # Cast sicuri
     for c in ['reviews','photos_count','reviews_per_score_1','reviews_per_score_2','reviews_per_score_3','reviews_per_score_4','reviews_per_score_5']:
         df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0)
     df['rating'] = pd.to_numeric(df['rating'], errors='coerce')
 
-    # Condivisioni negative
     total_reviews = df['reviews'].replace(0, np.nan)
-    bad_share = (df['reviews_per_score_1'] + df['reviews_per_score_2'] + df['reviews_per_score_3']) / total_reviews
-    bad_share = bad_share.fillna(0).clip(0, 1)
+    bad_share = (df['reviews_per_score_1']+df['reviews_per_score_2']+df['reviews_per_score_3'])/total_reviews
+    bad_share = bad_share.fillna(0).clip(0,1)
 
-    # Normalizzazioni
-    volume_norm = np.log10(df['reviews'] + 1)
-    volume_norm = volume_norm / volume_norm.max() if volume_norm.max() > 0 else volume_norm*0
+    volume_norm = np.log10(df['reviews']+1)
+    volume_norm = volume_norm/volume_norm.max() if volume_norm.max()>0 else volume_norm*0
 
-    rating_gap = (4.6 - df['rating']).clip(lower=0) / 1.6
+    rating_gap = (4.6 - df['rating']).clip(lower=0)/1.6
 
-    photos_per_review = (df['photos_count'] / df['reviews']).replace([np.inf,-np.inf], np.nan).fillna(0)
-    photos_norm = (photos_per_review / photos_per_review.max()).clip(0,1) if photos_per_review.max() > 0 else photos_per_review*0
+    photos_per_review = (df['photos_count']/df['reviews']).replace([np.inf,-np.inf],np.nan).fillna(0)
+    photos_norm = (photos_per_review/photos_per_review.max()).clip(0,1) if photos_per_review.max()>0 else photos_per_review*0
 
-    w1, w2, w3, w4 = weights
+    w1,w2,w3,w4 = weights
     denom = max(w1+w2+w3+w4, 1e-9)
-    raw = w1*volume_norm + w2*bad_share + w3*rating_gap + w4*(1 - photos_norm)
+    raw = w1*volume_norm + w2*bad_share + w3*rating_gap + w4*(1-photos_norm)
     score = (raw/denom)*100
 
     out = df.copy()
     out['GMB_Opportunity_Score'] = score.round(1)
-    out['has_website'] = out['site'].astype(str).str.len().fillna(0) > 5
-    # Link Google Maps
+    out['has_website'] = out['site'].astype(str).str.len().fillna(0)>5
     def maps_link(row):
-        lat, lon = row.get('latitude'), row.get('longitude')
+        lat,lon=row.get('latitude'),row.get('longitude')
         if pd.notnull(lat) and pd.notnull(lon):
             return f"https://www.google.com/maps/search/?api=1&query={lat},{lon}"
         return None
-    out['maps_link'] = out.apply(maps_link, axis=1)
+    out['maps_link']=out.apply(maps_link,axis=1)
     return out
 
 # -----------------------------
@@ -185,128 +156,113 @@ raw = read_excel(up)
 weights = (w1,w2,w3,w4)
 processed = process(raw, weights)
 
-# CMS detection on-demand
 with st.expander("🔎 Rileva WordPress — esegue richieste web, usa con parsimonia"):
-    run_cms = st.checkbox("Esegui rilevazione CMS ora", value=False)
+    run_cms = st.checkbox("Esegui rilevazione ora", value=False)
     if run_cms:
-        st.warning("Verranno effettuate richieste HTTP ai siti presenti.")
         processed['cms_guess'] = processed['site'].astype(str).apply(guess_cms)
     else:
-        # fallback veloce da URL solo per WP
         processed['cms_guess'] = np.where(
             processed['site'].astype(str).str.contains('wp-content|wp-json|wp-includes|/wp-', case=False, na=False),
             'WordPress (pattern URL)',
-            np.where(processed['has_website'], 'Altro', 'No site')
-        ).str.contains('wordpress|wp-content|wp-json', case=False, na=False),
-            'WordPress (URL pattern)',
-            np.where(processed['has_website'], 'Unknown', 'No site')
+            np.where(processed['has_website'],'Altro','No site')
         )
 
-# Filters
 cities = sorted([c for c in processed['city'].dropna().unique().tolist() if str(c).strip()])
-col1, col2, col3, col4 = st.columns([1,1,1,1])
+col1,col2,col3,col4=st.columns([1,1,1,1])
 with col1:
     city_sel = st.multiselect("Filtra città", cities)
 with col2:
-    min_reviews = st.number_input("Min. recensioni", 0, 100000, 0, 10)
+    min_reviews = st.number_input("Min. recensioni",0,100000,0,10)
 with col3:
-    site_filter = st.selectbox("Sito web", ["Tutti","Con sito","Senza sito"])
+    site_filter = st.selectbox("Sito web",["Tutti","Con sito","Senza sito"])
 with col4:
-    cms_filter = st.selectbox("CMS", ["Tutti","WordPress","Altro","No site"])  
+    cms_filter = st.selectbox("CMS",["Tutti","WordPress","Altro","No site"])
 
-f = processed.copy()
+f=processed.copy()
 if city_sel:
-    f = f[f['city'].isin(city_sel)]
+    f=f[f['city'].isin(city_sel)]
 if min_reviews>0:
-    f = f[f['reviews']>=min_reviews]
+    f=f[f['reviews']>=min_reviews]
 if site_filter=="Con sito":
-    f = f[f['has_website']]
+    f=f[f['has_website']]
 elif site_filter=="Senza sito":
-    f = f[~f['has_website']]
-
-if cms_filter != "Tutti":
-    if cms_filter == "WordPress":
-        f = f[f['cms_guess'].str.contains("WordPress", na=False)]
+    f=f[~f['has_website']]
+if cms_filter!="Tutti":
+    if cms_filter=="WordPress":
+        f=f[f['cms_guess'].str.contains("WordPress",na=False)]
     else:
-        f = f[f['cms_guess'] == cms_filter]
+        f=f[f['cms_guess']==cms_filter]
 
-# Sort controls
-sort_col = st.selectbox("Ordina per", ["GMB_Opportunity_Score","reviews","rating","city","name"]) 
-sort_dir = st.radio("Direzione", ["Desc","Asc"], horizontal=True)
-f = f.sort_values(sort_col, ascending=(sort_dir=="Asc"))
+sort_col=st.selectbox("Ordina per",["GMB_Opportunity_Score","reviews","rating","city","name"])
+sort_dir=st.radio("Direzione",["Desc","Asc"],horizontal=True)
+f=f.sort_values(sort_col,ascending=(sort_dir=="Asc"))
 
 # Map
 st.subheader("🗺️ Mappa")
-map_df = f[['latitude','longitude','name','GMB_Opportunity_Score','rating','reviews']].dropna(subset=['latitude','longitude'])
+map_df=f[['latitude','longitude','name','GMB_Opportunity_Score','rating','reviews']].dropna(subset=['latitude','longitude'])
 if len(map_df)>0:
-    # Base OSM senza token Mapbox
-    tile_layer = pdk.Layer(
+    tile_layer=pdk.Layer(
         "TileLayer",
         data="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
         min_zoom=0,
         max_zoom=19,
         tile_size=256,
-        pickable=False,
-        parameters={"brightness": 0.0}
+        pickable=False
     )
-    points = pdk.Layer(
+    points=pdk.Layer(
         "ScatterplotLayer",
         data=map_df,
         get_position='[longitude, latitude]',
         get_radius=70,
-        get_fill_color=[230, 57, 70],  # visibile sia su light che su dark
+        get_fill_color=[230,57,70],
         get_line_color=[255,255,255],
         line_width_min_pixels=1,
-        pickable=True,
+        pickable=True
     )
-    view_state = pdk.ViewState(
+    view_state=pdk.ViewState(
         latitude=float(map_df['latitude'].mean()),
         longitude=float(map_df['longitude'].mean()),
         zoom=11
     )
-    tooltip = {"html": "<b>{name}</b><br/>Score: {GMB_Opportunity_Score}<br/>⭐ {rating} • {reviews} rec.", "style": {"backgroundColor": "white", "color": "black"}}
-    st.pydeck_chart(pdk.Deck(layers=[tile_layer, points], initial_view_state=view_state, tooltip=tooltip, map_style=None))
+    tooltip={"html":"<b>{name}</b><br/>Score: {GMB_Opportunity_Score}<br/>⭐ {rating} • {reviews} rec.","style":{"backgroundColor":"white","color":"black"}}
+    st.pydeck_chart(pdk.Deck(layers=[tile_layer,points],initial_view_state=view_state,tooltip=tooltip,map_style=None))
 else:
     st.info("Nessun punto mappabile con i filtri correnti.")
 
 # Table
 st.subheader("📊 Elenco")
-show_cols = ['name','city','full_address','phone','site','cms_guess','rating','reviews',
-             'reviews_per_score_1','reviews_per_score_2','reviews_per_score_3',
-             'reviews_per_score_4','reviews_per_score_5','photos_count','GMB_Opportunity_Score','maps_link']
+show_cols=['name','city','full_address','phone','site','cms_guess','rating','reviews',
+           'reviews_per_score_1','reviews_per_score_2','reviews_per_score_3','reviews_per_score_4','reviews_per_score_5','photos_count','GMB_Opportunity_Score','maps_link']
 for c in show_cols:
     if c not in f.columns:
-        f[c] = np.nan
-st.dataframe(f[show_cols], use_container_width=True)
+        f[c]=np.nan
+st.dataframe(f[show_cols],use_container_width=True)
 
-# Export
-csv = f[show_cols].to_csv(index=False).encode('utf-8')
-st.download_button("⬇️ Esporta CSV filtrato", data=csv, file_name="prospect_filtrato.csv", mime="text/csv")
+csv=f[show_cols].to_csv(index=False).encode('utf-8')
+st.download_button("⬇️ Esporta CSV filtrato",data=csv,file_name="prospect_filtrato.csv",mime="text/csv")
 
-# Details panel
 st.subheader("🔗 Azioni rapide")
-sel_name = st.selectbox("Seleziona attività per aprire link utili", ["—"] + f['name'].astype(str).tolist())
-if sel_name != "—":
-    row = f[f['name'].astype(str)==sel_name].iloc[0]
-    c1, c2, c3 = st.columns(3)
+sel_name=st.selectbox("Seleziona attività",["—"]+f['name'].astype(str).tolist())
+if sel_name!="—":
+    row=f[f['name'].astype(str)==sel_name].iloc[0]
+    c1,c2,c3=st.columns(3)
     with c1:
         if pd.notnull(row.get('site')) and str(row['site']).strip():
-            st.link_button("Apri sito", str(row['site']))
+            st.link_button("Apri sito",str(row['site']))
         else:
-            st.button("Apri sito", disabled=True)
+            st.button("Apri sito",disabled=True)
     with c2:
         if pd.notnull(row.get('maps_link')) and str(row['maps_link']).strip():
-            st.link_button("Apri in Google Maps", str(row['maps_link']))
+            st.link_button("Apri Maps",str(row['maps_link']))
         else:
-            st.button("Apri in Google Maps", disabled=True)
+            st.button("Apri Maps",disabled=True)
     with c3:
-        # link alla scheda recensioni se presente
-        colname = 'location_reviews_link' if 'location_reviews_link' in f.columns else None
-        link = row.get(colname) if colname else None
+        colname='location_reviews_link' if 'location_reviews_link' in f.columns else None
+        link=row.get(colname) if colname else None
         if link and str(link).strip():
-            st.link_button("Apri scheda recensioni", str(link))
+            st.link_button("Apri recensioni",str(link))
         else:
-            st.button("Apri scheda recensioni", disabled=True)
+            st.button("Apri recensioni",disabled=True)
 
 st.divider()
-st.caption("Suggerimenti: usa i filtri per città e numero recensioni. Il punteggio considera volume, quota negative, gap da 4.6★ e scarsità di foto.")
+st.caption("Filtra per città, sito e CMS. Il punteggio considera volume, quota negative, gap da 4.6★ e scarsità di foto. CMS: solo WordPress/Altro/No site.")
