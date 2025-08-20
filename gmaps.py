@@ -51,11 +51,10 @@ def read_excel(file):
         st.stop()
 
 @st.cache_data(show_spinner=False)
-def guess_cms(url: str, timeout=5):
-    """Semplice regola: è WordPress se /wp-admin NON restituisce 404.
-    - Prova http/https e varianti con/senza www
-    - Segue i redirect (login, ecc.)
-    Ritorna: 'WordPress', 'Altro' o 'No site'.
+def guess_cms(url: str, timeout=5, cache_bust: int = 0):
+    """Semplice e affidabile: è WordPress se /wp-admin o /wp-login.php NON restituiscono 404
+    oppure se la **destinazione finale** o **qualsiasi redirect** punta a /wp-login.php.
+    Ritorna: 'WordPress', 'Altro', 'No site'.
     """
     sess = requests.Session()
     sess.headers.update({"User-Agent":"Mozilla/5.0"})
@@ -67,33 +66,44 @@ def guess_cms(url: str, timeout=5):
         bases = [u] if u.startswith("http") else [f"https://{u}", f"http://{u}"]
         out = set()
         for b in bases:
-            out.add(b.rstrip('/'))
+            b = b.rstrip('/')
+            out.add(b)
             if "://www." in b:
-                out.add(b.replace("://www.", "://").rstrip('/'))
+                out.add(b.replace("://www.", "://"))
             else:
                 proto, rest = b.split("://", 1)
-                out.add(f"{proto}://www.{rest}".rstrip('/'))
+                out.add(f"{proto}://www.{rest}")
         return list(out)
 
-    def is_wp(base: str) -> bool:
+    def check_endpoint(base: str, ep: str) -> bool:
         try:
-            r = sess.get(base + "/wp-admin", timeout=timeout, allow_redirects=True)
-            # se NON è 404, consideriamo WP (200/301/302/401/403 tipici)
-            if r is not None and r.status_code != 404:
-                return True
-            # fallback su /wp-login.php, stessa regola
-            r2 = sess.get(base + "/wp-login.php", timeout=timeout, allow_redirects=True)
-            if r2 is not None and r2.status_code != 404:
-                return True
+            r = sess.get(base + ep, timeout=timeout, allow_redirects=True)
         except Exception:
             return False
+        if r is None:
+            return False
+        # 1) Se status finale NON è 404 → probabile WP
+        if r.status_code != 404:
+            # 2) Se URL finale contiene wp-login.php → WP certo
+            final_url = (r.url or "").lower()
+            if "/wp-login.php" in final_url or "/wp-admin" in final_url:
+                return True
+            # 3) Se nella catena redirect c'è wp-login.php → WP
+            for h in r.history or []:
+                loc = (h.headers.get('Location','') or '').lower()
+                if '/wp-login.php' in loc or '/wp-admin' in loc:
+                    return True
+            # 4) Se status è 200/301/302/401/403 su ep WP → molto probabile WP
+            if r.status_code in (200,301,302,401,403):
+                return True
         return False
 
     variants = norm_variants(url)
     if not variants:
         return "No site"
+
     for base in variants:
-        if is_wp(base):
+        if check_endpoint(base, "/wp-admin") or check_endpoint(base, "/wp-login.php"):
             return "WordPress"
     return "Altro"
     sess.headers.update({"User-Agent":"Mozilla/5.0"})
@@ -167,6 +177,16 @@ processed = process(raw, weights)
 
 with st.expander("🔎 Rileva WordPress — esegue richieste web, usa con parsimonia"):
     run_cms = st.checkbox("Esegui rilevazione ora", value=False)
+    force = st.checkbox("Forza ricalcolo (ignora cache)", value=False)
+    if run_cms:
+        nonce = np.random.randint(0, 1_000_000) if force else 0
+        processed['cms_guess'] = processed['site'].astype(str).apply(lambda u: guess_cms(u, cache_bust=nonce))
+    else:
+        processed['cms_guess'] = np.where(
+            processed['site'].astype(str).str.contains('wp-content|wp-json|wp-includes|/wp-', case=False, na=False),
+            'WordPress (pattern URL)',
+            np.where(processed['has_website'],'Altro','No site')
+        )
     if run_cms:
         processed['cms_guess'] = processed['site'].astype(str).apply(guess_cms)
     else:
