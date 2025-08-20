@@ -31,7 +31,28 @@ with st.sidebar:
 # -----------------------------
 @st.cache_data(show_spinner=False)
 def read_excel(file):
-    return pd.read_excel(file)
+    """Robusta lettura: supporta .xlsx/.xls/.xlsm (richiede openpyxl) e .csv.
+    Mostra un errore chiaro se manca openpyxl in cloud."""
+    from io import BytesIO
+    from pathlib import Path
+    name = getattr(file, "name", "uploaded")
+    ext = Path(name).suffix.lower()
+    if ext in [".csv", ".txt"]:
+        # prova autodetect del separatore
+        try:
+            return pd.read_csv(file)
+        except Exception:
+            file.seek(0)
+            return pd.read_csv(file, sep=";")
+    # Excel
+    try:
+        return pd.read_excel(file, engine="openpyxl")
+    except ImportError:
+        st.error("Manca il pacchetto `openpyxl`. Aggiungilo a requirements.txt: `openpyxl>=3.1.3`.")
+        st.stop()
+    except Exception as e:
+        st.exception(e)
+        st.stop()
 
 @st.cache_data(show_spinner=False)
 def guess_cms(url: str, timeout=5):
