@@ -55,42 +55,118 @@ def read_excel(file):
         st.stop()
 
 @st.cache_data(show_spinner=False)
-def guess_cms(url: str, timeout=5):
-    """Heuristica leggera: controlla HTML e URL per WordPress, Shopify, Wix, Joomla, Squarespace.
-    Ritorna stringa CMS o 'Unknown'."""
-    if not url or url == "nan":
-        return "No site"
-    try:
-        # normalizza
-        if not url.startswith("http"):
-            url = "http://" + url
-        # pattern da URL
-        low = url.lower()
-        if any(k in low for k in ["wp-content", "wp-json", "/wp-"]):
-            return "WordPress (URL pattern)"
-        host = urlparse(url).netloc
-        # richiesta
-        r = requests.get(url, timeout=timeout, headers={"User-Agent":"Mozilla/5.0"})
-        html = r.text.lower()
-        if "wp-content" in html or "wp-json" in html or "wordpress" in html:
+def guess_cms(url: str, timeout=6):
+    """Rilevazione CMS robusta.
+    - Normalizza URL (http/https, www)
+    - Controlla meta generator, HTML e header server
+    - Prova endpoint tipici: /wp-json (WP), /wp-login.php (WP)
+    Ritorna una stringa tra: WordPress, Shopify, Wix, Squarespace, Joomla, Drupal,
+    PrestaShop, Magento, Webflow, Weebly, Blogger, Unknown, No site.
+    """
+    import re
+    from bs4 import BeautifulSoup  # optional dependency; we fall back if missing
+    sess = requests.Session()
+    sess.headers.update({"User-Agent":"Mozilla/5.0"})
+
+    def _try(url):
+        try:
+            r = sess.get(url, timeout=timeout, allow_redirects=True)
+            return r
+        except Exception:
+            return None
+
+    def _norm(u):
+        if not u or u == "nan":
+            return []
+        u = u.strip()
+        # aggiungi schema se manca
+        candidates = []
+        if not u.startswith("http"):
+            candidates += [f"https://{u}", f"http://{u}"]
+        else:
+            candidates.append(u)
+        # aggiungi variante www se manca/presente
+        out = set()
+        for c in candidates:
+            p = urlparse(c)
+            host = p.netloc
+            if host.startswith("www."):
+                out.add(c)
+                out.add(c.replace("//www.", "//"))
+            else:
+                out.add(c)
+                out.add(c.replace("//", "//www."))
+        return list(out)
+
+    # indicatori
+    def detect_from_response(r):
+        if r is None:
+            return None
+        h = {k.lower():v for k,v in r.headers.items()}
+        text = r.text.lower() if isinstance(r.text, str) else ""
+        # meta generator
+        gen = ""
+        try:
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(r.text, 'html.parser')
+            m = soup.find("meta", attrs={"name":"generator"})
+            if m and m.get("content"):
+                gen = m.get("content").lower()
+        except Exception:
+            pass
+
+        def any_in(s, keys):
+            return any(k in s for k in keys)
+
+        # WordPress
+        if any_in(text, ["wp-content","wp-json","wp-includes","wordpress"]) or any_in(gen, ["wordpress"]):
             return "WordPress"
-        if "shopify" in html or ".myshopify.com" in host:
+        # Shopify
+        if any_in(text, ["shopify"]) or any_in(" ".join([f"{k}:{v}" for k,v in h.items()]), ["shopid","x-shopify","x-cache: hit from cloudfront"]):
             return "Shopify"
-        if "wix" in html or "wixsite.com" in html:
+        # Wix
+        if any_in(text, ["wixsite","wix.com"]) or "x-wix-request-id" in h:
             return "Wix"
-        if "joomla" in html:
-            return "Joomla"
-        if "squarespace" in html:
+        # Squarespace
+        if "x-squarespace-server" in h or any_in(text, ["squarespace"]):
             return "Squarespace"
-        if "weebly" in html:
-            return "Weebly"
-        if "prestashop" in html:
+        # Joomla
+        if any_in(text, ["joomla"]) or "x-content-powered-by:joomla" in " ".join(h.keys()):
+            return "Joomla"
+        # Drupal
+        if any_in(text, ["drupal-settings-json","drupal"] ) or "x-generator" in h and "drupal" in h.get("x-generator"," ").lower():
+            return "Drupal"
+        # PrestaShop
+        if any_in(text, ["prestashop"]) or any(k.lower().startswith("prestashop") for k in r.cookies.keys()):
             return "PrestaShop"
-        if "magento" in html:
+        # Magento
+        if any_in(text, ["mage-", "magento"]) or any(k.lower().startswith("x-magento") for k in h.keys()):
             return "Magento"
-        return "Unknown"
-    except Exception:
-        return "Unknown (error)"
+        # Webflow
+        if any_in(text, ["webflow"]):
+            return "Webflow"
+        # Weebly
+        if any_in(text, ["weebly"]):
+            return "Weebly"
+        # Blogger
+        if any_in(text, ["blogger"]) or "blogspot." in r.url.lower():
+            return "Blogger"
+        return None
+
+    # tenta URL e varianti
+    for candidate in _norm(url):
+        r = _try(candidate)
+        cms = detect_from_response(r)
+        if cms:
+            return cms
+        # endpoint specifici WP
+        if r is not None and r.status_code < 500:
+            for ep in ["/wp-json", "/wp-login.php"]:
+                rr = _try(candidate.rstrip("/") + ep)
+                if rr is not None and rr.status_code in (200, 401, 403):
+                    if "wordpress" in (rr.text.lower() if isinstance(rr.text,str) else "") or "application/json" in rr.headers.get("content-type"," "):
+                        return "WordPress"
+    return "Unknown"
 
 @st.cache_data(show_spinner=False)
 def process(df: pd.DataFrame, weights):
@@ -203,12 +279,24 @@ f = f.sort_values(sort_col, ascending=(sort_dir=="Asc"))
 st.subheader("🗺️ Mappa")
 map_df = f[['latitude','longitude','name','GMB_Opportunity_Score','rating','reviews']].dropna(subset=['latitude','longitude'])
 if len(map_df)>0:
-    tooltip = {"html": "<b>{name}</b><br/>Score: {GMB_Opportunity_Score}<br/>⭐ {rating} • {reviews} rec.", "style": {"backgroundColor": "white", "color": "black"}}
-    layer = pdk.Layer(
+    # Base OSM senza token Mapbox
+    tile_layer = pdk.Layer(
+        "TileLayer",
+        data="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+        min_zoom=0,
+        max_zoom=19,
+        tile_size=256,
+        pickable=False,
+        parameters={"brightness": 0.0}
+    )
+    points = pdk.Layer(
         "ScatterplotLayer",
         data=map_df,
         get_position='[longitude, latitude]',
-        get_radius=60,
+        get_radius=70,
+        get_fill_color=[230, 57, 70],  # visibile sia su light che su dark
+        get_line_color=[255,255,255],
+        line_width_min_pixels=1,
         pickable=True,
     )
     view_state = pdk.ViewState(
@@ -216,7 +304,8 @@ if len(map_df)>0:
         longitude=float(map_df['longitude'].mean()),
         zoom=11
     )
-    st.pydeck_chart(pdk.Deck(layers=[layer], initial_view_state=view_state, tooltip=tooltip))
+    tooltip = {"html": "<b>{name}</b><br/>Score: {GMB_Opportunity_Score}<br/>⭐ {rating} • {reviews} rec.", "style": {"backgroundColor": "white", "color": "black"}}
+    st.pydeck_chart(pdk.Deck(layers=[tile_layer, points], initial_view_state=view_state, tooltip=tooltip, map_style=None))
 else:
     st.info("Nessun punto mappabile con i filtri correnti.")
 
